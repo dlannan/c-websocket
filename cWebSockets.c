@@ -13,6 +13,8 @@ WebSocket Protocol Implementation
 Author: Marcin Kelar ( marcin.kelar@gmail.com )
 *******************************************************************/
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "include/cWebSockets.h"
 
 /*
@@ -65,7 +67,7 @@ void WEBSOCKET_generate_handshake( const char *data, char *dst, unsigned int dst
 @data - entire data received with socket
 @dst - pointer to char array where the result will be stored
 @dst_len - size of @dst */
-void WEBSOCKET_generate_handshake( const char *data, char *dst, const unsigned int dst_len ) {
+int WEBSOCKET_generate_handshake( const char *data, char *dst, const unsigned int dst_len ) {
 	char origin[ 512 ];
 	char host[ 512 ];
 	char additional_headers[ 2048 ];
@@ -95,7 +97,7 @@ void WEBSOCKET_generate_handshake( const char *data, char *dst, const unsigned i
 	REQUEST_get_header_value(data, WEBSOCKET_KEY_HEADER, sec_websocket_key, 512 );
 	if( sec_websocket_key == NULL ) {
 		dst = NULL;
-		return;
+		return -1;
 	}
 
 	strncat( sec_websocket_key, WEBSOCKET_MAGIC_STRING, 512 );
@@ -114,7 +116,7 @@ void WEBSOCKET_generate_handshake( const char *data, char *dst, const unsigned i
 	base64_encode( sha1_hex, source_len - 1, sec_websocket_accept, 512 );
 
 	snprintf( dst, dst_len, WEBSOCKET_HANDSHAKE_RESPONSE, additional_headers, sec_websocket_accept );
-
+	return strlen(dst);
 }
 
 /*
@@ -124,7 +126,7 @@ int WEBSOCKET_set_content( const char *data, int data_length, unsigned char *dst
 @dst - pointer to char array where the result will be stored
 @dst_len - size of @dst
 @return - WebSocket frame size */
-int WEBSOCKET_set_content( const char *data, int data_length, unsigned char *dst, const unsigned int dst_len ) {
+int WEBSOCKET_set_content( const char *data, int64_t data_length, unsigned char *dst, const unsigned int dst_len ) {
 	unsigned char *message = ( unsigned char * )malloc( 65535 * sizeof( char ) );
 	int i;
 	int data_start_index;
@@ -174,7 +176,7 @@ int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst
 @data_length - size of @data
 @dst - pointer to char array, where the result will be stored
 @return - size of @dst */
-int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst, const unsigned int dst_len ) {
+int WEBSOCKET_get_content( const char *data, int64_t data_length, unsigned char *dst, const unsigned int dst_len, unsigned char *hdr ) {
 	unsigned int i, j;
 	unsigned char mask[4];
 	unsigned int packet_length = 0;
@@ -182,11 +184,22 @@ int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst
 	int index_first_mask = 0;
 	int index_first_data_byte = 0;
 
-	if( ( unsigned char )data[0] != 129 ) {
+	unsigned char test = ( unsigned char )data[0];
+	hdr[0] = test;
+	hdr[1] = (unsigned char)data[1];
+
+	unsigned int ismask = (data[1] >> 7);
+
+	unsigned char opcode = test & 0x0F;
+	if( ( opcode != 1 ) && ( opcode != 2 ) ) {
 		dst = NULL;
-		if( ( unsigned char )data[0] == 136 ) {
+		if( opcode == 8 ) {
 			/* WebSocket client disconnected */
 			return -2;
+		} else if( opcode == 9 ) {
+			memcpy( dst, data, data_length );
+			dst[0] = 0x8A;
+			return data_length;
 		}
 		/* Unknown error */
 		return -1;
@@ -201,6 +214,9 @@ int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst
 		mask[1] = data[3];
 		mask[2] = data[4];
 		mask[3] = data[5];
+
+		packet_length = length_code;
+
 	} else if( length_code == 126 ) {
 		index_first_mask = 4;
 
@@ -208,6 +224,11 @@ int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst
 		mask[1] = data[5];
 		mask[2] = data[6];
 		mask[3] = data[7];
+
+		unsigned short d1 = (unsigned short)(unsigned char)data[2];
+		unsigned short d2 = (unsigned short)(unsigned char)data[3];
+		packet_length = (int)((d1 << 8) | d2);
+
 	} else if( length_code == 127 ) {
 		index_first_mask = 10;
 
@@ -215,16 +236,33 @@ int WEBSOCKET_get_content( const char *data, int data_length, unsigned char *dst
 		mask[1] = data[11];
 		mask[2] = data[12];
 		mask[3] = data[13];
+
+		unsigned long long d1 = ((unsigned long long)(unsigned char)data[2]) << 56;
+		unsigned long long d2 = ((unsigned long long)(unsigned char)data[3]) << 48;
+		unsigned long long d3 = ((unsigned long long)(unsigned char)data[4]) << 40;
+		unsigned long long d4 = ((unsigned long long)(unsigned char)data[5]) << 32;
+		unsigned long long d5 = ((unsigned long long)(unsigned char)data[6]) << 24;
+		unsigned long long d6 = ((unsigned long long)(unsigned char)data[7]) << 16;
+		unsigned long long d7 = ((unsigned long long)(unsigned char)data[8]) << 8;
+		unsigned long long d8 = ((unsigned long long)(unsigned char)data[9]);
+
+		packet_length =  (int) (d1 | d2 | d3 | d4 | d5 | d6 | d7 | d8);
 	}
 
-	index_first_data_byte = index_first_mask + 4;
+	int masksize = 4;
+	if(ismask == 0) masksize = 0;
+	index_first_data_byte = index_first_mask + masksize;
 
-	packet_length = data_length - index_first_data_byte;
-
-	for( i = index_first_data_byte, j = 0; i < data_length && j < dst_len; i++, j++ ) {
-		dst[ j ] = ( unsigned char )data[ i ] ^ mask[ j % 4];
+	//packet_length = data_length - index_first_data_byte;
+	if(ismask > 0) { 
+		for( i = index_first_data_byte, j = 0; i < data_length && j < dst_len; i++, j++ ) {
+			dst[ j ] = ( unsigned char )data[ i ] ^ mask[ j % 4];
+		}
+	} else {
+		for( i = index_first_data_byte, j = 0; i < data_length && j < dst_len; i++, j++ ) {
+			dst[ j ] = ( unsigned char )data[ i ];
+		}
 	}
-
 	return packet_length;
 }
 
